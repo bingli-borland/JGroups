@@ -656,6 +656,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         return 0;
     }
 
+    @ManagedAttribute(description="Number of tasks in the thread pool's queue")
     public int getThreadPoolQueueSize() {
         if(thread_pool instanceof ThreadPoolExecutor)
             return ((ThreadPoolExecutor)thread_pool).getQueue().size();
