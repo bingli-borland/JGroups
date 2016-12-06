@@ -156,8 +156,14 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     @Property(name="thread_pool.max_threads",description="Maximum thread pool size for the thread pool")
     protected int thread_pool_max_threads=100;
 
+    @Property(name="thread_pool.max_queue_size", description="The max size of the queue. 0 disables the queue")
+    protected int thread_pool_max_queue_size;
+
     @Property(name="thread_pool.keep_alive_time",description="Timeout in milliseconds to remove idle threads from pool")
     protected long thread_pool_keep_alive_time=30000;
+
+    @Property(name="internal_thread_pool.max_threads", description="Max number of threads for the internal thread pool")
+    protected int internal_thread_pool_max_threads;
 
 
     @Property(description="Interval (in ms) at which the time service updates its timestamp. 0 disables the time service")
@@ -650,6 +656,14 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         return 0;
     }
 
+    public int getThreadPoolQueueSize() {
+        if(thread_pool instanceof ThreadPoolExecutor)
+            return ((ThreadPoolExecutor)thread_pool).getQueue().size();
+        if(thread_pool instanceof ForkJoinPool)
+            return ((ForkJoinPool)thread_pool).getQueuedSubmissionCount();
+        return 0;
+    }
+
 
     @ManagedAttribute(description="Current number of active threads in the thread pool")
     public int getThreadPoolSizeActive() {
@@ -789,13 +803,19 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         if(thread_pool == null || (thread_pool instanceof ExecutorService && ((ExecutorService)thread_pool).isShutdown())) {
             if(thread_pool_enabled) {
                 int num_cores=Runtime.getRuntime().availableProcessors();
-                int max_internal_size=Math.max(4, num_cores);
+                int max_internal_size=Math.max(internal_thread_pool_max_threads, Math.max(4, num_cores));
+
                 if(log.isDebugEnabled())
                     log.debug("thread pool min/max/keep-alive: %d/%d/%d use_fork_join=%b, internal pool: %d/%d/%d (%d cores available)",
                               thread_pool_min_threads, thread_pool_max_threads, thread_pool_keep_alive_time, use_fork_join_pool,
                               0, max_internal_size, 30000, num_cores);
+
+                BlockingQueue<Runnable> queue=thread_pool_max_queue_size > 0?
+                  new ArrayBlockingQueue<>(thread_pool_max_queue_size) : new SynchronousQueue<>();
                 thread_pool=createThreadPool(thread_pool_min_threads, thread_pool_max_threads, thread_pool_keep_alive_time,
-                                             "abort", new SynchronousQueue<>(), thread_factory, log, use_fork_join_pool, use_common_fork_join_pool);
+                                             "abort", queue, thread_factory, log, use_fork_join_pool, use_common_fork_join_pool);
+                ((ThreadPoolExecutor)thread_pool).allowCoreThreadTimeOut(true);
+
                 internal_pool=createThreadPool(0, max_internal_size, 30000, "abort", new SynchronousQueue<>(), thread_factory, log, false, false);
             }
             else // otherwise use the caller's thread to unmarshal the byte buffer into a message
