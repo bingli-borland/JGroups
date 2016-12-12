@@ -658,6 +658,10 @@ public class UDP extends TP {
             }
         }
 
+        void submit(IpAddress sender, byte[] buf, int offset, int length) {
+            submitToThreadPool(thread_pool, () -> receive(sender, buf, offset, length),
+                               false, false);
+        }
 
         public void run() {
             final byte           receive_buf[]=new byte[66000]; // to be on the safe side (IPv6 == 65575 bytes, IPv4 = 65535)
@@ -675,8 +679,14 @@ public class UDP extends TP {
                     if(len > receive_buf.length && log.isErrorEnabled())
                         log.error(Util.getMessage("SizeOfTheReceivedPacket"), len, receive_buf.length, receive_buf.length);
 
-                    receive(new IpAddress(packet.getAddress(), packet.getPort()),
-                            receive_buf, packet.getOffset(), len);
+                    byte[] copy=new byte[len];
+                    System.arraycopy(receive_buf, packet.getOffset(), copy, 0, len);
+
+                    // thread_pool.execute(() -> receive(new IpAddress(packet.getAddress(), packet.getPort()), copy, 0, copy.length));
+                    submit(new IpAddress(packet.getAddress(), packet.getPort()), copy, 0, copy.length);
+
+                    //receive(new IpAddress(packet.getAddress(), packet.getPort()),
+                      //      receive_buf, packet.getOffset(), len);
                 }
                 catch(SocketException sock_ex) {
                     if(receiver_socket.isClosed()) {
