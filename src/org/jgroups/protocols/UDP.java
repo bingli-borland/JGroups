@@ -8,6 +8,8 @@ import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.annotations.Property;
 import org.jgroups.stack.IpAddress;
+import org.jgroups.util.Buf;
+import org.jgroups.util.BufferPool;
 import org.jgroups.util.SuppressLog;
 import org.jgroups.util.Util;
 
@@ -17,6 +19,7 @@ import java.net.*;
 import java.util.Formatter;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 
 /**
@@ -106,6 +109,8 @@ public class UDP extends TP {
       "If de-serialization is slow, increasing the number of receiver threads might yield better performance.")
     protected int mcast_receiver_threads=1;
 
+    @Property(description="Number of buffers in the buffer pool")
+    protected int buf_pool_size=8;
 
     /* --------------------------------------------- Fields ------------------------------------------------ */
 
@@ -113,6 +118,8 @@ public class UDP extends TP {
 
     /** The multicast address (mcast address and port) this member uses */
     protected IpAddress       mcast_addr;
+
+    protected BufferPool      buf_pool;
 
     /**
      * Socket used for
@@ -192,10 +199,27 @@ public class UDP extends TP {
             suppress_log_out_of_buffer_space.getCache().clear();
     }
 
+    @ManagedAttribute(description="Number of available buffers in the buffer pool")
+    public int getBufferPoolSize() {return buf_pool.size();}
+
+    @ManagedAttribute(description="Capacity of the buffer pool")
+    public int getBufferPoolCapacity() {return buf_pool.capacity();}
+
+    @ManagedAttribute(description="Number of times a new buffer had to be created because the buffer pool was exhausted")
+    public int getBufferPoolCreations() {return buf_pool.creates();}
+
+    @ManagedAttribute(description="Number of times the buffer pool was accessed to get a buffer")
+    public int getBufferPoolGets() {return buf_pool.gets();}
+
     public String getInfo() {
         StringBuilder sb=new StringBuilder();
         sb.append("group_addr=").append(mcast_group_addr.getHostName()).append(':').append(mcast_port).append("\n");
         return sb.toString();
+    }
+
+    public void resetStats() {
+        super.resetStats();
+        buf_pool.reset();
     }
 
     public void sendMulticast(byte[] data, int offset, int length) throws Exception {
@@ -248,6 +272,7 @@ public class UDP extends TP {
 
     public void init() throws Exception {
         super.init();
+        buf_pool=new BufferPool(buf_pool_size, 66000);
         if(is_mac && suppress_time_out_of_buffer_space > 0)
             suppress_log_out_of_buffer_space=new SuppressLog<>(log, "FailureSendingToPhysAddr", "SuppressMsg");
     }
@@ -658,37 +683,55 @@ public class UDP extends TP {
             }
         }
 
-        void submit(IpAddress sender, byte[] buf, int offset, int length) {
-            submitToThreadPool(thread_pool, () -> receive(sender, buf, offset, length),
+        void submit(IpAddress sender, Buf buf) {
+            if(Objects.equals(local_physical_addr, sender)) {
+                Util.close(buf);
+                //System.out.printf("[%s] released buffer %s\n", Thread.currentThread(), buf);
+                return;
+            }
+            submitToThreadPool(thread_pool, () -> {
+                                   try {
+                                       receive(sender, buf.getBuf(), buf.getOffset(), buf.getLength());
+                                   }
+                                   finally {
+                                       Util.close(buf);
+                                       //System.out.printf("[%s] released buffer %s\n", Thread.currentThread(), buf);
+                                   }
+                               },
                                false, false);
         }
 
         public void run() {
-            final byte           receive_buf[]=new byte[66000]; // to be on the safe side (IPv6 == 65575 bytes, IPv4 = 65535)
-            final DatagramPacket packet=new DatagramPacket(receive_buf, receive_buf.length);
+            // final byte           receive_buf[]=new byte[66000]; // to be on the safe side (IPv6 == 65575 bytes, IPv4 = 65535)
+            // final DatagramPacket packet=new DatagramPacket(receive_buf, receive_buf.length);
 
             while(thread != null && Thread.currentThread().equals(thread)) {
+                Buf buf=null;
                 try {
 
                     // solves Android ISSUE #24748 - DatagramPacket truncated UDP in ICS
-                    if(is_android)
-                        packet.setLength(receive_buf.length);
+                    // if(is_android)
+                      //  packet.setLength(receive_buf.length);
+
+
+                    buf=buf_pool.getBuffer();
+                    DatagramPacket packet=new DatagramPacket(buf.getBuf(), buf.getLength());
+
+                    //System.out.printf("[%s] %s: got buffer %s\n", Thread.currentThread(), name, buf);
 
                     receiver_socket.receive(packet);
                     int len=packet.getLength();
-                    if(len > receive_buf.length && log.isErrorEnabled())
-                        log.error(Util.getMessage("SizeOfTheReceivedPacket"), len, receive_buf.length, receive_buf.length);
-
-                    byte[] copy=new byte[len];
-                    System.arraycopy(receive_buf, packet.getOffset(), copy, 0, len);
+                    if(len > buf.getLength() && log.isErrorEnabled())
+                        log.error(Util.getMessage("SizeOfTheReceivedPacket"), len, buf.getLength(), buf.getLength());
 
                     // thread_pool.execute(() -> receive(new IpAddress(packet.getAddress(), packet.getPort()), copy, 0, copy.length));
-                    submit(new IpAddress(packet.getAddress(), packet.getPort()), copy, 0, copy.length);
+                    submit(new IpAddress(packet.getAddress(), packet.getPort()), buf);
 
                     //receive(new IpAddress(packet.getAddress(), packet.getPort()),
                       //      receive_buf, packet.getOffset(), len);
                 }
                 catch(SocketException sock_ex) {
+                    Util.close(buf);
                     if(receiver_socket.isClosed()) {
                         if(log.isDebugEnabled()) log.debug("receiver socket is closed, exception=" + sock_ex);
                         break;
@@ -696,8 +739,8 @@ public class UDP extends TP {
                     log.error(Util.getMessage("FailedReceivingPacket"), sock_ex);
                 }
                 catch(Throwable ex) {
-                    if(log.isErrorEnabled())
-                        log.error(Util.getMessage("FailedReceivingPacket"), ex);
+                    Util.close(buf);
+                    log.error(Util.getMessage("FailedReceivingPacket"), ex);
                 }
             }
             if(log.isDebugEnabled()) log.debug(name + " thread terminated");
